@@ -1,0 +1,1020 @@
+import os
+import time
+import cv2
+
+from picamera2 import Picamera2
+from ultralytics import YOLO
+
+
+# ============================================================
+# RIDEGUARD - COMPLETE BLIND-SPOT AWARENESS SYSTEM
+# ============================================================
+#
+# Raspberry Pi 5
+#   ↓
+# OV5647 Camera
+#   ↓
+# Picamera2
+#   ↓
+# YOLO11n
+#   ↓
+# Blind-spot detection
+#   ↓
+# Bluetooth RFCOMM
+#   ↓
+# ESP32
+#   ↓
+# LEFT  = GPIO14 + GPIO2
+# RIGHT = GPIO4 + GPIO27
+#
+# ============================================================
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+
+YOLO_SIZE = 416
+CONFIDENCE = 0.40
+
+# Number of consecutive frames required to confirm
+# a blind-spot detection or clearance.
+CONFIRM_FRAMES = 3
+
+# Bluetooth serial device
+RFCOMM_DEVICE = "/dev/rfcomm0"
+
+
+# ============================================================
+# VEHICLE CLASSES
+# ============================================================
+#
+# COCO:
+# 2 = car
+# 3 = motorcycle
+# 5 = bus
+# 7 = truck
+#
+
+VEHICLE_CLASSES = {
+    2: "car",
+    3: "motorcycle",
+    5: "bus",
+    7: "truck",
+}
+
+
+# ============================================================
+# HAPTIC STATE
+# ============================================================
+
+current_haptic = "OFF"
+
+
+def send_haptic(command):
+    """
+    Send LEFT / RIGHT / OFF to the ESP32.
+
+    The same command is not repeatedly transmitted.
+    """
+
+    global current_haptic
+
+    command = command.strip().upper()
+
+    if command not in ("LEFT", "RIGHT", "OFF"):
+        print(f"Invalid haptic command: {command}")
+        return
+
+    # Don't repeatedly send the same command
+    if command == current_haptic:
+        return
+
+    # Check Bluetooth serial device
+    if not os.path.exists(RFCOMM_DEVICE):
+
+        print()
+        print("WARNING:")
+        print(f"{RFCOMM_DEVICE} was not found.")
+        print("Run ./connect_esp32.sh")
+        print()
+
+        return
+
+    try:
+
+        with open(RFCOMM_DEVICE, "w") as bluetooth:
+
+            bluetooth.write(command + "\n")
+            bluetooth.flush()
+
+        current_haptic = command
+
+        print(f"HAPTIC -> {command}")
+
+    except Exception as error:
+
+        print(f"Bluetooth error: {error}")
+
+
+# ============================================================
+# BLIND-SPOT DETECTION
+# ============================================================
+
+def get_blindspot_side(cx, cy, width, height):
+
+    """
+    Determine whether the center of a vehicle
+    is inside the left or right blind-spot region.
+
+    Current prototype geometry:
+
+        LEFT:
+            x = 0% - 30%
+            y = 55% - 100%
+
+        RIGHT:
+            x = 70% - 100%
+            y = 55% - 100%
+
+    These are temporary prototype ROIs.
+    They can later be calibrated to the actual motorcycle.
+    """
+
+    left_limit = int(width * 0.30)
+
+    right_limit = int(width * 0.70)
+
+    y_limit = int(height * 0.55)
+
+
+    # Vehicle must be in lower portion
+    if cy < y_limit:
+        return None
+
+
+    # LEFT blind spot
+    if cx < left_limit:
+        return "LEFT"
+
+
+    # RIGHT blind spot
+    if cx > right_limit:
+        return "RIGHT"
+
+
+    # Outside blind spots
+    return None
+
+
+# ============================================================
+# DRAW BLIND-SPOT REGIONS
+# ============================================================
+
+def draw_blindspot_regions(frame):
+
+    height, width = frame.shape[:2]
+
+
+    # --------------------------------------------------------
+    # Coordinates
+    # --------------------------------------------------------
+
+    left_x1 = 0
+    left_x2 = int(width * 0.30)
+
+    right_x1 = int(width * 0.70)
+    right_x2 = width
+
+    y1 = int(height * 0.55)
+    y2 = height
+
+
+    # --------------------------------------------------------
+    # Transparent overlay
+    # --------------------------------------------------------
+
+    overlay = frame.copy()
+
+
+    # Left region
+    cv2.rectangle(
+        overlay,
+        (left_x1, y1),
+        (left_x2, y2),
+        (0, 0, 255),
+        -1
+    )
+
+
+    # Right region
+    cv2.rectangle(
+        overlay,
+        (right_x1, y1),
+        (right_x2, y2),
+        (0, 0, 255),
+        -1
+    )
+
+
+    # Apply transparency
+    frame = cv2.addWeighted(
+        overlay,
+        0.12,
+        frame,
+        0.88,
+        0
+    )
+
+
+    # --------------------------------------------------------
+    # Region borders
+    # --------------------------------------------------------
+
+    cv2.rectangle(
+        frame,
+        (left_x1, y1),
+        (left_x2, y2),
+        (0, 0, 255),
+        2
+    )
+
+    cv2.rectangle(
+        frame,
+        (right_x1, y1),
+        (right_x2, y2),
+        (0, 0, 255),
+        2
+    )
+
+
+    # --------------------------------------------------------
+    # Region labels
+    # --------------------------------------------------------
+
+    cv2.putText(
+        frame,
+        "LEFT BLIND SPOT",
+        (15, y1 + 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.60,
+        (0, 0, 255),
+        2
+    )
+
+
+    cv2.putText(
+        frame,
+        "RIGHT BLIND SPOT",
+        (right_x1 + 5, y1 + 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.60,
+        (0, 0, 255),
+        2
+    )
+
+
+    return frame
+
+
+# ============================================================
+# DRAW ALERT BANNER
+# ============================================================
+
+def draw_alert_banner(frame, side):
+
+    height, width = frame.shape[:2]
+
+
+    if side == "LEFT":
+
+        cv2.rectangle(
+            frame,
+            (0, 0),
+            (width, 48),
+            (0, 0, 255),
+            -1
+        )
+
+        cv2.putText(
+            frame,
+            "!!! LEFT BLIND SPOT ALERT !!!",
+            (70, 33),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (255, 255, 255),
+            2
+        )
+
+
+    elif side == "RIGHT":
+
+        cv2.rectangle(
+            frame,
+            (0, 0),
+            (width, 48),
+            (0, 0, 255),
+            -1
+        )
+
+        cv2.putText(
+            frame,
+            "!!! RIGHT BLIND SPOT ALERT !!!",
+            (65, 33),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (255, 255, 255),
+            2
+        )
+
+
+    else:
+
+        cv2.putText(
+            frame,
+            "BLIND SPOT CLEAR",
+            (15, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (0, 255, 0),
+            2
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    global current_haptic
+
+
+    # ========================================================
+    # STARTUP
+    # ========================================================
+
+    print()
+    print("==========================================")
+    print("           RIDEGUARD SYSTEM")
+    print("==========================================")
+    print("Camera       : OV5647")
+    print("Resolution   :", f"{CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+    print("Model        : YOLO11n")
+    print("YOLO size    :", YOLO_SIZE)
+    print("Confidence   :", CONFIDENCE)
+    print("Confirmation :", CONFIRM_FRAMES, "frames")
+    print("Bluetooth    :", RFCOMM_DEVICE)
+    print("==========================================")
+    print()
+
+
+    # ========================================================
+    # CHECK BLUETOOTH
+    # ========================================================
+
+    if not os.path.exists(RFCOMM_DEVICE):
+
+        print("ERROR: ESP32 Bluetooth connection not found.")
+        print()
+        print("Run:")
+        print("    ./connect_esp32.sh")
+        print()
+
+        return
+
+
+    print("Bluetooth connection: OK")
+
+
+    # ========================================================
+    # LOAD YOLO
+    # ========================================================
+
+    print("Loading YOLO11n...")
+
+    try:
+
+        model = YOLO("yolo11n.pt")
+
+    except Exception as error:
+
+        print()
+        print("ERROR loading YOLO11n:")
+        print(error)
+        print()
+
+        return
+
+
+    print("YOLO11n loaded.")
+
+
+    # ========================================================
+    # CAMERA
+    # ========================================================
+
+    print("Starting camera...")
+
+
+    # Create OpenCV window BEFORE starting camera
+    cv2.namedWindow(
+        "RIDEGUARD",
+        cv2.WINDOW_NORMAL
+    )
+
+    # Large display window.
+    # This DOES NOT change camera or YOLO resolution.
+    cv2.resizeWindow(
+        "RIDEGUARD",
+        960,
+        720
+    )
+
+
+    # Initialize camera
+    picam2 = Picamera2()
+
+
+    camera_config = picam2.create_preview_configuration(
+
+        main={
+            "size": (
+                CAMERA_WIDTH,
+                CAMERA_HEIGHT
+            ),
+            "format": "RGB888"
+        }
+
+    )
+
+
+    picam2.configure(camera_config)
+
+
+    # Start camera
+    picam2.start()
+
+
+    # Give camera time to initialize
+    time.sleep(2)
+
+
+    print("Camera started.")
+    print()
+    print("==========================================")
+    print("          RIDEGUARD ACTIVE")
+    print("==========================================")
+    print("Press Q to stop.")
+    print()
+
+
+    # ========================================================
+    # TEMPORAL CONFIRMATION
+    # ========================================================
+
+    candidate_side = None
+    candidate_count = 0
+
+    confirmed_side = None
+
+    absent_count = 0
+
+
+    # ========================================================
+    # FPS
+    # ========================================================
+
+    fps_start = time.time()
+
+    fps_frames = 0
+
+    fps = 0.0
+
+
+    # ========================================================
+    # MAIN LOOP
+    # ========================================================
+
+    try:
+
+        while True:
+
+
+            # ------------------------------------------------
+            # Capture camera frame
+            # ------------------------------------------------
+
+            frame = picam2.capture_array()
+
+
+            # ------------------------------------------------
+            # YOLO inference
+            # ------------------------------------------------
+
+            results = model.predict(
+
+                frame,
+
+                imgsz=YOLO_SIZE,
+
+                conf=CONFIDENCE,
+
+                classes=list(
+                    VEHICLE_CLASSES.keys()
+                ),
+
+                verbose=False
+            )
+
+
+            result = results[0]
+
+
+            # ------------------------------------------------
+            # Draw blind-spot regions
+            # ------------------------------------------------
+
+            display = draw_blindspot_regions(
+                frame.copy()
+            )
+
+
+            # ------------------------------------------------
+            # Find blind-spot vehicles
+            # ------------------------------------------------
+
+            blindspot_candidates = []
+
+
+            if result.boxes is not None:
+
+
+                for box in result.boxes:
+
+
+                    # ----------------------------------------
+                    # Class
+                    # ----------------------------------------
+
+                    cls_id = int(
+                        box.cls[0].item()
+                    )
+
+
+                    # ----------------------------------------
+                    # Confidence
+                    # ----------------------------------------
+
+                    confidence = float(
+                        box.conf[0].item()
+                    )
+
+
+                    # ----------------------------------------
+                    # Bounding box
+                    # ----------------------------------------
+
+                    x1, y1, x2, y2 = (
+
+                        box.xyxy[0]
+                        .cpu()
+                        .numpy()
+                        .astype(int)
+
+                    )
+
+
+                    # ----------------------------------------
+                    # Bounding box center
+                    # ----------------------------------------
+
+                    cx = int(
+                        (x1 + x2) / 2
+                    )
+
+                    cy = int(
+                        (y1 + y2) / 2
+                    )
+
+
+                    # ----------------------------------------
+                    # Vehicle name
+                    # ----------------------------------------
+
+                    vehicle_name = VEHICLE_CLASSES.get(
+                        cls_id,
+                        "vehicle"
+                    )
+
+
+                    # ----------------------------------------
+                    # Blind-spot side
+                    # ----------------------------------------
+
+                    side = get_blindspot_side(
+
+                        cx,
+                        cy,
+
+                        CAMERA_WIDTH,
+                        CAMERA_HEIGHT
+                    )
+
+
+                    # ----------------------------------------
+                    # Blind-spot vehicle
+                    # ----------------------------------------
+
+                    if side is not None:
+
+                        box_color = (
+                            0,
+                            0,
+                            255
+                        )
+
+
+                        label = (
+                            f"BLIND SPOT: "
+                            f"{vehicle_name} "
+                            f"{confidence:.2f}"
+                        )
+
+
+                        blindspot_candidates.append(
+
+                            (
+                                side,
+                                confidence,
+                                vehicle_name
+                            )
+
+                        )
+
+
+                    # ----------------------------------------
+                    # Normal vehicle
+                    # ----------------------------------------
+
+                    else:
+
+                        box_color = (
+                            0,
+                            255,
+                            0
+                        )
+
+
+                        label = (
+                            f"{vehicle_name} "
+                            f"{confidence:.2f}"
+                        )
+
+
+                    # ----------------------------------------
+                    # Bounding box
+                    # ----------------------------------------
+
+                    cv2.rectangle(
+
+                        display,
+
+                        (x1, y1),
+
+                        (x2, y2),
+
+                        box_color,
+
+                        2
+                    )
+
+
+                    # ----------------------------------------
+                    # Label
+                    # ----------------------------------------
+
+                    cv2.putText(
+
+                        display,
+
+                        label,
+
+                        (
+                            x1,
+                            max(
+                                25,
+                                y1 - 8
+                            )
+                        ),
+
+                        cv2.FONT_HERSHEY_SIMPLEX,
+
+                        0.50,
+
+                        box_color,
+
+                        2
+                    )
+
+
+                    # ----------------------------------------
+                    # Center point
+                    # ----------------------------------------
+
+                    cv2.circle(
+
+                        display,
+
+                        (cx, cy),
+
+                        5,
+
+                        box_color,
+
+                        -1
+                    )
+
+
+            # =================================================
+            # DETERMINE CURRENT DANGER SIDE
+            # =================================================
+
+            detected_side = None
+
+
+            if blindspot_candidates:
+
+
+                # If both sides have vehicles,
+                # use strongest YOLO confidence.
+
+                strongest = max(
+
+                    blindspot_candidates,
+
+                    key=lambda item: item[1]
+
+                )
+
+
+                detected_side = strongest[0]
+
+
+            # =================================================
+            # TEMPORAL CONFIRMATION
+            # =================================================
+
+            if detected_side is not None:
+
+
+                # A blind-spot vehicle exists
+                absent_count = 0
+
+
+                # Same side as previous frame
+                if detected_side == candidate_side:
+
+                    candidate_count += 1
+
+
+                # New side
+                else:
+
+                    candidate_side = detected_side
+
+                    candidate_count = 1
+
+
+                # --------------------------------------------
+                # Confirm detection
+                # --------------------------------------------
+
+                if candidate_count >= CONFIRM_FRAMES:
+
+
+                    if confirmed_side != candidate_side:
+
+
+                        confirmed_side = candidate_side
+
+
+                        if confirmed_side == "LEFT":
+
+                            send_haptic(
+                                "LEFT"
+                            )
+
+
+                        elif confirmed_side == "RIGHT":
+
+                            send_haptic(
+                                "RIGHT"
+                            )
+
+
+            # =================================================
+            # NO BLIND-SPOT VEHICLE
+            # =================================================
+
+            else:
+
+
+                candidate_side = None
+
+                candidate_count = 0
+
+                absent_count += 1
+
+
+                # Require 3 clear frames
+                if absent_count >= CONFIRM_FRAMES:
+
+
+                    if confirmed_side is not None:
+
+
+                        confirmed_side = None
+
+
+                        send_haptic(
+                            "OFF"
+                        )
+
+
+            # =================================================
+            # ALERT
+            # =================================================
+
+            draw_alert_banner(
+
+                display,
+
+                confirmed_side
+            )
+
+
+            # =================================================
+            # HAPTIC STATUS
+            # =================================================
+
+            cv2.putText(
+
+                display,
+
+                f"HAPTIC: {current_haptic}",
+
+                (
+                    10,
+                    CAMERA_HEIGHT - 40
+                ),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                0.60,
+
+                (255, 255, 255),
+
+                2
+            )
+
+
+            # =================================================
+            # FPS
+            # =================================================
+
+            fps_frames += 1
+
+
+            elapsed = (
+                time.time()
+                - fps_start
+            )
+
+
+            if elapsed >= 1.0:
+
+
+                fps = (
+                    fps_frames
+                    / elapsed
+                )
+
+
+                fps_frames = 0
+
+                fps_start = time.time()
+
+
+            cv2.putText(
+
+                display,
+
+                f"FPS: {fps:.1f}",
+
+                (
+                    CAMERA_WIDTH - 120,
+                    CAMERA_HEIGHT - 15
+                ),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                0.55,
+
+                (255, 255, 255),
+
+                2
+            )
+
+
+            # =================================================
+            # DISPLAY CAMERA
+            # =================================================
+
+            cv2.imshow(
+
+                "RIDEGUARD",
+
+                display
+            )
+
+
+            # =================================================
+            # KEYBOARD
+            # =================================================
+
+            key = (
+                cv2.waitKey(1)
+                & 0xFF
+            )
+
+
+            if key == ord("q"):
+
+                break
+
+
+    # ========================================================
+    # CTRL+C
+    # ========================================================
+
+    except KeyboardInterrupt:
+
+        print()
+        print("Stopping RIDEGUARD...")
+
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    finally:
+
+
+        print()
+        print("Shutting down...")
+
+
+        # ALWAYS turn motors OFF
+        try:
+
+            # Force state reset so OFF is transmitted
+            current_haptic = "LEFT"
+
+            send_haptic("OFF")
+
+        except Exception:
+
+            pass
+
+
+        # Stop camera
+        try:
+
+            picam2.stop()
+
+        except Exception:
+
+            pass
+
+
+        # Close OpenCV
+        cv2.destroyAllWindows()
+
+
+        print("HAPTIC: OFF")
+        print("Camera stopped.")
+        print("RIDEGUARD stopped.")
+        print()
+
+
+# ============================================================
+# PROGRAM ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
