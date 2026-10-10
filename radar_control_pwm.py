@@ -1,0 +1,231 @@
+"""RIDEGUARD radar: Pi 5 hardware PWM servo + HC-SR04.
+
+Servo signal: BCM GPIO18 / physical pin 12, driven by RP1 hardware PWM.
+HC-SR04 TRIG: BCM GPIO23 / physical pin 16.
+HC-SR04 ECHO: BCM GPIO24 / physical pin 18 through a voltage divider.
+Servo power: Pi 5V pin 2 (as currently wired); GND pin 14.
+Sensor power: 5V pin 4; GND pin 20.
+
+On Pi 5, rpi-hardware-pwm uses channel 2 for GPIO18. Kernel/overlay
+configuration is documented in README_RIDEGUARD_SETUP.txt.
+"""
+import os
+import platform
+import threading
+import time
+
+from gpiozero import DigitalInputDevice, DigitalOutputDevice
+from gpiozero.pins.lgpio import LGPIOFactory
+from rpi_hardware_pwm import HardwarePWM
+
+SERVO_PIN = 18
+TRIG_PIN = 23
+ECHO_PIN = 24
+PWM_CHANNEL = 2  # Pi 5: PWM channel 2 maps to GPIO18 with pwm-2chan overlay
+
+MIN_ANGLE = -35
+MAX_ANGLE = 35
+ANGLE_STEP = 10
+SERVO_SETTLE_TIME = 0.18
+READING_DELAY = 0.02
+ECHO_TIMEOUT = 0.025
+MIN_DISTANCE_CM = 2.0
+MAX_DISTANCE_CM = 400.0
+THREAT_DISTANCE_CM = 40.0
+ACTIVATE_SCANS = 1
+CLEAR_SCANS = 2
+# A complete sweep takes several seconds; 3 seconds was too short.
+STALE_AFTER_SECONDS = 8.0
+
+class RadarController:
+    def __init__(self):
+        self.factory = LGPIOFactory()
+        self.servo_pwm = None
+        self.trig = None
+        self.echo = None
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.worker_thread = None
+        self.current_angle = 0
+        self.state = {side: self._new_side_state() for side in ('left', 'right')}
+        self.last_valid_distance = {'left': None, 'right': None}
+        self.last_valid_time = {'left': None, 'right': None}
+        self.sweep_angles = list(range(MIN_ANGLE, MAX_ANGLE + 1, ANGLE_STEP))
+        if self.sweep_angles[-1] != MAX_ANGLE:
+            self.sweep_angles.append(MAX_ANGLE)
+        try:
+            # Pi 5 kernels before 6.12 commonly expose RP1 PWM as pwmchip2;
+            # kernel 6.12+ generally exposes it as pwmchip0.
+            release = platform.release().split('-')[0]
+            version = tuple(int(part) for part in release.split('.')[:2])
+            chip = 0 if version >= (6, 12) else 2
+            self.servo_pwm = HardwarePWM(pwm_channel=PWM_CHANNEL, hz=50, chip=chip)
+            self.servo_pwm.start(self._angle_to_duty(0))
+            self.trig = DigitalOutputDevice(TRIG_PIN, initial_value=False, pin_factory=self.factory)
+            self.echo = DigitalInputDevice(ECHO_PIN, pull_up=False, pin_factory=self.factory)
+            time.sleep(0.25)
+        except Exception:
+            self.close_hardware()
+            raise
+
+    @staticmethod
+    def _new_side_state():
+        return {'threat': False, 'distance_cm': None, 'trend': 'unknown',
+                'valid': False, 'stale': True, 'last_scan_time': None,
+                'close_count': 0, 'clear_count': 0}
+
+    @staticmethod
+    def _angle_to_duty(angle):
+        # Match original AngularServo pulse range: 0.5–2.5 ms at 50 Hz.
+        angle = max(-90.0, min(90.0, float(angle)))
+        pulse_ms = 0.5 + ((angle + 90.0) / 180.0) * 2.0
+        return (pulse_ms / 20.0) * 100.0
+
+    def _set_angle(self, angle):
+        self.current_angle = angle
+        self.servo_pwm.change_duty_cycle(self._angle_to_duty(angle))
+
+    def measure_distance(self):
+        self.trig.off()
+        time.sleep(0.000002)
+        self.trig.on()
+        time.sleep(0.000010)
+        self.trig.off()
+        wait_start = time.monotonic()
+        while self.echo.value == 0:
+            if time.monotonic() - wait_start > ECHO_TIMEOUT:
+                return None
+        pulse_start = time.monotonic()
+        while self.echo.value == 1:
+            if time.monotonic() - pulse_start > ECHO_TIMEOUT:
+                return None
+        distance = (time.monotonic() - pulse_start) * 17150.0
+        return distance if MIN_DISTANCE_CM <= distance <= MAX_DISTANCE_CM else None
+
+    @staticmethod
+    def angle_to_side(angle):
+        if angle < 0:
+            return 'left'
+        if angle > 0:
+            return 'right'
+        return None
+
+    def scan_sweep(self):
+        readings = {'left': [], 'right': []}
+        angles = self.sweep_angles + list(reversed(self.sweep_angles[:-1]))
+        for angle in angles:
+            if self.stop_event.is_set():
+                break
+            self._set_angle(angle)
+            time.sleep(SERVO_SETTLE_TIME)
+            if self.stop_event.is_set():
+                break
+            distance = self.measure_distance()
+            side = self.angle_to_side(angle)
+            if side and distance is not None:
+                readings[side].append(distance)
+            time.sleep(READING_DELAY)
+        return {side: (min(values) if values else None) for side, values in readings.items()}
+
+    def update_side(self, side, distance_cm):
+        now = time.monotonic()
+        with self.lock:
+            state = self.state[side]
+            if distance_cm is None:
+                last_time = self.last_valid_time[side]
+                state['valid'] = False
+                state['stale'] = last_time is None or now - last_time > STALE_AFTER_SECONDS
+                return
+            previous = self.last_valid_distance[side]
+            if previous is None:
+                trend = 'unknown'
+            elif distance_cm < previous - 2.0:
+                trend = 'decreasing'
+            elif distance_cm > previous + 2.0:
+                trend = 'increasing'
+            else:
+                trend = 'steady'
+            self.last_valid_distance[side] = distance_cm
+            self.last_valid_time[side] = now
+            state.update(distance_cm=round(distance_cm, 1), trend=trend,
+                         valid=True, stale=False, last_scan_time=now)
+            if distance_cm <= THREAT_DISTANCE_CM:
+                state['close_count'] += 1
+                state['clear_count'] = 0
+                if state['close_count'] >= ACTIVATE_SCANS:
+                    state['threat'] = True
+            else:
+                state['clear_count'] += 1
+                state['close_count'] = 0
+                if state['clear_count'] >= CLEAR_SCANS:
+                    state['threat'] = False
+
+    def _worker(self):
+        try:
+            while not self.stop_event.is_set():
+                result = self.scan_sweep()
+                if self.stop_event.is_set():
+                    break
+                self.update_side('left', result['left'])
+                self.update_side('right', result['right'])
+        except Exception as error:
+            print(f'[RADAR] Worker error: {error}')
+        finally:
+            print('[RADAR] Scanning stopped.')
+
+    def start(self):
+        if self.worker_thread and self.worker_thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.worker_thread = threading.Thread(target=self._worker, name='rideguard-radar', daemon=True)
+        self.worker_thread.start()
+        print('[RADAR] Hardware-PWM sweep started.')
+
+    def get_status(self):
+        now = time.monotonic()
+        result = {}
+        with self.lock:
+            for side in ('left', 'right'):
+                data = self.state[side].copy()
+                last_time = self.last_valid_time[side]
+                stale = last_time is None or now - last_time > STALE_AFTER_SECONDS
+                data['stale'] = stale
+                if stale:
+                    data['valid'] = False
+                    data['threat'] = False
+                result[side] = data
+        return result
+
+    def close_hardware(self):
+        for name in ('trig', 'echo'):
+            device = getattr(self, name, None)
+            if device is not None:
+                try:
+                    device.close()
+                except Exception:
+                    pass
+                setattr(self, name, None)
+        if self.servo_pwm is not None:
+            try:
+                self.servo_pwm.change_duty_cycle(self._angle_to_duty(0))
+                time.sleep(0.25)
+                self.servo_pwm.stop()
+            except Exception:
+                pass
+            self.servo_pwm = None
+        if self.factory is not None:
+            try:
+                self.factory.close()
+            except Exception:
+                pass
+            self.factory = None
+
+    def stop(self):
+        self.stop_event.set()
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=8.0)
+        if self.worker_thread and self.worker_thread.is_alive():
+            print('[RADAR] WARNING: sweep thread still active; not closing GPIO underneath it.')
+            return
+        self.close_hardware()
+        print('[RADAR] Hardware released.')
